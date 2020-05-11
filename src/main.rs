@@ -4,17 +4,17 @@ use chrono::Local;
 use env_logger::Builder;
 use futures::stream::SplitStream;
 use futures::{SinkExt, Stream};
-use futures_util::io::ErrorKind;
+
 use futures_util::StreamExt;
 use log::LevelFilter;
 use log::*;
 use std::env;
-use std::io::{Error, Write};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncWriteExt, ReadHalf};
+use tokio::io::ReadHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
@@ -116,8 +116,8 @@ async fn handle_connection(
     let ws_stream = accept_async(stream).await.expect("Failed to accept");
     debug!("new WebSocket connection: {}", peer);
 
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    let mut upstream = TcpStream::connect(&config.destination_addr).await;
+    let (mut ws_sender, ws_receiver) = ws_stream.split();
+    let upstream = TcpStream::connect(&config.destination_addr).await;
     if !upstream.is_ok() {
         error!(
             "failed to connect to upstream: {}",
@@ -126,7 +126,7 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let (mut tcp_receiver, mut tcp_sender) = tokio::io::split(upstream.unwrap());
+    let (tcp_receiver, tcp_sender) = tokio::io::split(upstream.unwrap());
     let mut tcp_sender = FramedWrite::new(tcp_sender, NetworkCodec);
 
     let mut proxy_stream = ProxyStream {
@@ -138,23 +138,31 @@ async fn handle_connection(
         match event {
             ProxyEvent::WebSocketRead(buffer) => {
                 debug!("received from websocket, len: {}", buffer.len());
-                tcp_sender.send(buffer).await;
+                if !tcp_sender.send(buffer).await.is_ok() {
+                    error!("error sending to tcp client");
+                }
             }
 
             ProxyEvent::TcpRead(buffer) => {
                 debug!("received from tcp, len: {}", buffer.len());
-                ws_sender.send(Message::Binary(buffer)).await;
+                if !ws_sender.send(Message::Binary(buffer)).await.is_ok() {
+                    error!("error sending to websocket client");
+                }
             }
 
             ProxyEvent::TcpClosed => {
                 debug!("tcp closed");
-                ws_sender.close().await;
+                if !ws_sender.close().await.is_ok() {
+                    error!("error closing websocket sender");
+                }
                 break;
             }
 
             ProxyEvent::WebSocketClosed => {
                 debug!("websocket closed");
-                tcp_sender.close().await;
+                if !tcp_sender.close().await.is_ok() {
+                    error!("error closing tcp sender");
+                }
                 break;
             }
         }
